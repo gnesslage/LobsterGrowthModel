@@ -7,5 +7,5 @@ The model corrects for two potential sources of bias in the use of tagging data:
 
 Estimated growth parameters can then be used to generate sex-specific, seasonal growth transition matrices and simulate growth in the absence of fishing mortality.
 
-This model was developed in support of the 2025 ASMFC American lobster stock assessment with funding provided by National Sea Grant American Lobster Research Program 2023 (Award NA23OAR4170577).
+This model was developed in support of the 2025 ASMFC American lobster stock assessment with funding provided by National Sea Grant American Lobster Research Program 2023 (Award NA23OAR4170577-T1-01).
 
