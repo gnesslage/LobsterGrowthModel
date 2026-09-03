@@ -1,0 +1,1554 @@
+---
+title: "Lobster Growth Model"
+author: "M. Wilberg, G. Nesslage, B. Shank, J. Kipp"
+date: today
+format: 
+  html:
+    toc: true
+    title-block-banner: true 
+    self-contained: true
+
+execute:
+  echo: false
+
+editor: 
+  markdown: 
+    wrap: sentence
+knitr:
+  opts_chunk:
+    collapse: false
+    message: false
+    warning: false
+    comment: "#>"
+    R.options:
+      knitr.graphics.auto_pdf: true
+---
+
+## Load required R libraries
+
+```{r}
+#| echo: false
+
+library(dplyr)
+library(ggplot2)
+library(RTMB)
+library(lubridate)
+library(gridExtra)
+library(readxl)
+library(purrr)
+library(tidyr)
+library(patchwork)
+library(cowplot)
+```
+
+## Clear the workspace
+
+```{r}
+#| echo: false
+
+rm(list=ls(all=TRUE))
+#clear_viewer_pane()
+graphics.off()    
+#cat("\014")  
+```
+
+## User defines these
+
+```{r}
+#| echo: false
+setwd("C:/Lobster_growth/LobsterGrowthModel") #set working directory to project directory
+
+sh_lg<-"SelCAnn" #run name
+pdfyn<-1 #1=print results as pdf, otherwise not
+
+selC<-1 #1=apply tagging "selectivity" correction, otherwise not. 
+
+#Specify tagging selectivity intercepts and slopes for each stock unit and sex. 
+#sel_p=relative probability of tag reporting within 21 days as a function of length if selC=1, else relative probability of tag reporting is independent of carapace length
+if(selC==1){
+  sel_p<-data.frame(region=c("GOMGBK","GOMGBK","SNE","SNE"),sex=c("Male","Female","Male","Female"),int=c(-5.591487,-4.851153,-5.526019,-5.731555),slope=c(0.05635251,0.0394142,0.0596933,0.0507824)) 
+  #sel_p<-data.frame(region=c("GOMGBK","GOMGBK","SNE","SNE"),sex=c("Male","Female","Male","Female"),int=c(-5.80048,-4.71683,-5.14416,-5.03788),slope=c(0.05495,0.03889,0.05488,0.0436)) #for assmt
+}else{
+    sel_p<-data.frame(region=c("GOMGBK","GOMGBK","SNE","SNE"),sex=c("Male","Female","Male","Female"),int=c(10,10,10,10),slope=c(0,0,0,0))
+    }
+
+binw<-5 #binwidth in mm carapce length (CL)
+bins<-seq(53,223,binw) #set smallest length of first and last length bins
+
+tolmeth<-1 #1=use tolerance threshold for growth/no growth as specified on next line, 2=use percentage of CL (percCL in following line)
+tol<-3 #tolerance for "no growth"
+percCL<-0.05 
+
+usetemp<-0 #1=use temperature/growting degree day (GDD) data, otherwise not
+sneGDD<-"Inshore" #"SlectInshore" vs "Offshore" GDD time series
+
+age53G<-5 #assumed age at 53mmCL in GOMGBK for plotting age data vs growth estimates
+age53S<-4 #assumed age at 53mmCL in SNE for plotting age data vs growth estimates
+
+doselsims<-2 #1= do simulations, otherwise don't
+```
+
+## Prepare data
+
+```{r}
+#| echo: false
+
+#Calculate middle of bins
+midbins<-bins+2.5 
+
+#Set list of model scenarios
+sexes<-rep(c("Female","Male"),2) #List of sexes for both stock units
+#sexes<-rep(c("Female","Male"),1) #Use for DFO-only data analysis
+SUs<-c(rep("GOMGBK",2),rep("SNE",2)) #List of stock unit acronyms
+#SUs<-c(rep("GOMGBK",2)) #Use for DFO-only data analysis
+qtrtransl<-c(1,1,1,1) #Index/id for quarterly growth transitions to estimate
+#qtrtransl<-c(1,1) #Use for DFO-only data analysis
+mxincs<-c(rep(75,2),rep(40,2)) #Max growth increments for GOMGBK and SNE
+#mxincs<-c(rep(75,2)) #Use for DFO-only data analysis
+
+
+#Import and prep tagging data
+GOMGBKdat<-read.csv("AllTagDatGOMGBKclgNEWAnnual_3.csv") #Annual SAS-recommended month selection
+GOMGBKdat$rate<-GOMGBKdat$SizeDiff/GOMGBKdat$TagCL #Comparable metric to ASMFC assessments
+GOMGBKdat$SU<-"GOMGBK"
+#unique(GOMGBKdat$Source)
+
+SNEdat<-read.csv("AllTagDatSNEclgNEWAnnual_2.csv") #Annual
+#SNEdat<-read.csv(file.choose()) #MW needed this
+SNEdat$rate<-SNEdat$SizeDiff/SNEdat$TagCL #Comparable metric to ASMFC assessments
+SNEdat$SU<-"SNE"
+#unique(SNEdat$Source)
+
+#Refine data to be used
+#Remove outliers = very large increments SizeDiff>20 and immediate recaps that weren't given the time to grow (small SizeDiff given small DAL timeframe). See also archived analyses chunk.
+GOMGBKdat<-filter(GOMGBKdat,SizeDiff<20&TagCL>=53&DaysAtLarge>21)
+SNEdat<-filter(SNEdat,SizeDiff<20&TagCL>=53&DaysAtLarge>21)
+#Remove data sources not representative of length bins and fishery timing assumed in ASMFC model
+GOMGBKdat<-filter(GOMGBKdat,!(Source%in%c("TLC","DFO","NHSCUBA","NHTbar")))
+SNEdat<-filter(SNEdat,!(Source%in%c("TLC")))
+
+#Import and prepare bottom temperature or growing degree day (GDD) data
+if(usetemp==1){
+  tdat<-read.csv("GDDts.csv") #Note: available only 1978-2019 (shorter than assmt timeframe)
+  GOMtdat<-filter(tdat,SU=="GOMGBK") 
+  SNEtdat<-filter(tdat,Region==sneGDD)
+  #limit tagging dataset to temp time series
+  nGOMtdat<-merge(GOMGBKdat,GOMtdat,by=c("SU","CapYear")) 
+  nSNEtdat<-merge(SNEdat,SNEtdat,by=c("SU","CapYear")) 
+  GOMGBK_GDDmax=max(nGOMtdat$GDD) #divide by max to rescale
+  nGOMtdat$temp<-nGOMtdat$GDD/max(nGOMtdat$GDD)
+  GOMGBK_GDDmean<-mean(nGOMtdat$temp)
+  nSNEtdat$temp<-nSNEtdat$GDD/max(nSNEtdat$GDD)
+  SNE_GDDmean<-mean(nSNEtdat$temp)
+  GOMGBK_meanDAL<-mean(nGOMtdat$DaysAtLarge)
+  SNE_meanDAL<-mean(nSNEtdat$DaysAtLarge)
+  alltag<-rbind(nGOMtdat,nSNEtdat)
+  alltag$seasspan<-1
+}else{
+  GOMGBK_meanDAL<-mean(GOMGBKdat$DaysAtLarge)
+  SNE_meanDAL<-mean(SNEdat$DaysAtLarge)
+  GOMGBK_GDDmean<-1
+  SNE_GDDmean<-1
+  alltag<-rbind(GOMGBKdat,SNEdat)
+  alltag$seasspan<-1
+  alltag$temp<-1
+  }
+
+#View tagging data
+p1<-ggplot(alltag,aes(TagCL))+geom_histogram(col = "black", fill = "gray")+xlab("Carapace Length (mm)")+facet_wrap(~SU)+theme_classic(base_size = 15)+xlim(50,225)+ylim(0,900)
+p2<-ggplot(alltag,aes(SizeDiff))+geom_histogram(col = "black", fill = "gray")+xlab("Growth incremement (mm)")+facet_wrap(~SU)+theme_classic(base_size = 15)+xlim(0,20)+ylim(0,400)
+p3<-ggplot(alltag,aes(DaysAtLarge))+geom_histogram(col = "black", fill = "gray")+xlab("Days At Large")+facet_wrap(~SU)+theme_classic(base_size = 15)+xlim(0,730)
+p4<-ggplot(alltag,aes(rate))+geom_histogram(col = "black", fill = "gray")+xlab("Growth rate")+facet_wrap(~SU)+theme_classic(base_size = 15)+xlim(0,0.5)+ylim(0,500)
+grid.arrange(p1,p3,p2,p4,nrow=2)
+
+#Growth transition matrices and projected probability of growth at length used in 2025 assessment (2.7.25)
+GOMGBK_S2_F <- as.matrix(read_excel("Assmt GTMs.xlsx", sheet = 1, col_names = TRUE))
+GOMGBK_S2_F_probG=cbind(midbins,1-diag(GOMGBK_S2_F));colnames(GOMGBK_S2_F_probG)=c("x","y")
+GOMGBK_S2_M <-  as.matrix(read_excel("Assmt GTMs.xlsx", sheet = 2, col_names = TRUE))
+GOMGBK_S2_M_probG=cbind(midbins,1-diag(GOMGBK_S2_M));colnames(GOMGBK_S2_M_probG)=c("x","y")
+GOMGBK_S3_F <-  as.matrix(read_excel("Assmt GTMs.xlsx", sheet = 3, col_names = TRUE))
+GOMGBK_S3_F_probG=cbind(midbins,1-diag(GOMGBK_S3_F));colnames(GOMGBK_S3_F_probG)=c("x","y")
+GOMGBK_S3_M <-  as.matrix(read_excel("Assmt GTMs.xlsx", sheet = 4, col_names = TRUE))
+GOMGBK_S3_M_probG=cbind(midbins,1-diag(GOMGBK_S3_M));colnames(GOMGBK_S3_M_probG)=c("x","y")
+
+SNE_S2_F <-  as.matrix(read_excel("Assmt GTMs.xlsx", sheet = 5, col_names = TRUE))
+SNE_S2_F_probG=cbind(midbins,1-diag(SNE_S2_F));colnames(SNE_S2_F_probG)=c("x","y")
+SNE_S2_M <-  as.matrix(read_excel("Assmt GTMs.xlsx", sheet = 6, col_names = TRUE))
+SNE_S2_M_probG=cbind(midbins,1-diag(SNE_S2_M));colnames(SNE_S2_M_probG)=c("x","y")
+SNE_S3_F <-  as.matrix(read_excel("Assmt GTMs.xlsx", sheet = 7, col_names = TRUE))
+SNE_S3_F_probG=cbind(midbins,1-diag(SNE_S3_F));colnames(SNE_S3_F_probG)=c("x","y")
+SNE_S3_M <-  as.matrix(read_excel("Assmt GTMs.xlsx", sheet = 8, col_names = TRUE))
+SNE_S3_M_probG=cbind(midbins,1-diag(SNE_S3_M));colnames(SNE_S3_M_probG)=c("x","y")
+
+#ASMFC 2025 assessment molt prob and inc estimates for comparison
+GOMGBK_FInfl<-68
+GOMGBK_FAsy<-11.15
+GOMGBK_Fb<-0.26
+GOMGBK_Fa<--6.35
+GOMGBK_Finc<-cbind(GOMGBK_S2_F_probG[,1],rep(GOMGBK_FAsy,nrow(GOMGBK_S2_F_probG)))
+GOMGBK_Finc[, 2] <- ifelse(
+  GOMGBK_Finc[, 1] >= GOMGBK_FInfl,     
+  GOMGBK_FAsy,                
+  GOMGBK_Fa + GOMGBK_Fb * GOMGBK_Finc[, 1]   
+)
+colnames(GOMGBK_Finc)<-c("x","y")
+
+#import GAM predictions for male increments from JK A
+male_GAMpred_assmt<-read.csv("male gam molt increments.csv")
+male_GAMpred_assmtsub<-filter(male_GAMpred_assmt,CL%in%bins)
+add_bins<-bins[25:35];add_bins<-data.frame(add_bins);add_bins$inc_pred<-24.314276;colnames(add_bins)<-c("CL","inc_pred")
+GOMGBK_Minc<-rbind(male_GAMpred_assmtsub,add_bins);colnames(GOMGBK_Minc)<-c("x","y")
+
+SNE_Finc<-cbind(SNE_S2_F_probG[,1],rep(7.9,nrow(SNE_S2_F_probG)));colnames(SNE_Finc)<-c("x","y")
+SNE_Minc<-cbind(SNE_S2_M_probG[,1],rep(9.38,nrow(SNE_S2_M_probG)));colnames(SNE_Minc)<-c("x","y")
+prob_names<-c("GOMGBK_S2_F_probG","GOMGBK_S2_M_probG","SNE_S2_F_probG","SNE_S2_M_probG")
+inc_names<-c("GOMGBK_Finc","GOMGBK_Minc","SNE_Finc","SNE_Minc")
+
+runsmatrix<-data.frame(qtrtransl,sexes,SUs,mxincs,prob_names,inc_names)
+
+#Ageing data for comparison with mark-recapture estimates (Huntsberger et al. 2020  https://doi.org/10.1139/cjfas-2020-0018)
+agedat=read.csv("CarlHuntsberger LAA data.csv")
+agedat$Date=as.Date(agedat$DateProcessed,tryFormats = c("%m/%d/%Y"))
+agedat$Year1=year(agedat$Date)
+agedat$Month=month(agedat$Date)
+agedat$Day=day(agedat$Date)
+agedatwild=filter(agedat,Treatment=="Wild Caught") #select only wild caught
+# ggplot(agedatwild,aes(factor(EstAge),CL,color=factor(Sex)))+geom_boxplot()+facet_wrap(~SU)+theme_classic()+xlab("Estimated Age")+ylab("Carapace length (mm)")+guides(color = guide_legend(title = "Sex"))
+# ggplot(agedatwild,aes(CL,factor(EstAge),color=factor(Sex)))+geom_boxplot()+facet_wrap(~SU)+theme_classic()+ylab("Estimated Age")+xlab("Carapace length (mm)")+guides(color = guide_legend(title = "Sex"))
+agedatwild$Source="Huntsberger et al. 2020"
+agedatwild2=filter(agedatwild[,c("Sex","CL","EstAge","Source","SU")])
+names(agedatwild2)[2]="Mean"#;names(agedatwild2)[3]="Year"
+GOMGBKage=filter(agedatwild2,SU=="GOMGBK")#&CL>=53)
+GOMGBKage=GOMGBKage[,-5]
+GOMGBKage$Year=GOMGBKage$EstAge-age53G
+SNEage=filter(agedatwild2,SU=="SNE")#&CL>=53)
+SNEage=SNEage[,-5]
+SNEage$Year=SNEage$EstAge-age53S
+```
+
+## Functions
+
+```{r}
+#| echo: false
+
+#Linear function
+linear<-function(X,beta){
+  Y<-X%*%beta
+  return(Y)
+}
+
+#Logistic function
+logistic_p<-function(Y){
+  p<-exp(Y)/(1+exp(Y))
+  return(p)
+}
+
+#Combo linear + logistic function
+linlog<-function(X,beta){
+  Y<-X%*%beta
+  p<-exp(Y)/(1+exp(Y))
+  return(p)
+}
+
+#Logistic function
+logistic_p<-function(Y){
+  p<-exp(Y)/(1+exp(Y))
+  return(p)
+}
+
+#Approximate selectivity
+sel<-function(x,int,slope){
+  return(exp(int+x*slope)/(1+exp(int+x*slope)))
+}
+
+# #Approximate Selectivity from Courchene and Stokesbury 2011
+# sel_old<-function(x){
+#   return((0.07+1/(1+exp(0.27*(91-x))))/1.07)
+# }
+
+#Function to generate length transition matrix based on growth model estimated parameters
+make_trans_matrix<-function(G_prob,G_mean,G_sd,lengthbins,binwd){
+  #get number of length bins
+  nb<-length(lengthbins)
+  #set up empty matrix for transition matrix
+  Tmat<-matrix(0,nrow=nb,ncol=nb)
+  #Set diagonal equal to 1-probability of growing
+  diag(Tmat)=1-G_prob
+  #fill in upper diagonal for those that grow
+  for(i in 1:(nb-2)){
+    ################################
+    #Normal growth probabilities
+    ################################
+    if(data_sdt$dist=="normal"){
+      Tmat[i,i]<-Tmat[i,i]+G_prob[i]*pnorm(bins[i+1],G_mean[i]+bins[i]+binwd/2,G_sd[i],lower.tail = TRUE) #lobsters with little or no growth stay in the diagonal
+      for(j in (i+1):(nb-1)){
+        #calculate cumulative distribution to lower end of bin
+        phi1<-pnorm(bins[j],G_mean[i]+bins[i]+binwd/2,G_sd[i],lower.tail = TRUE)
+        #calculate cumulative distribution to upper end of bin
+        phi2<-pnorm(bins[j+1],G_mean[i]+bins[i]+binwd/2,G_sd[i])
+        #if(j<(nb-1)){
+          #calculate the probability of growing to that bin
+          Tmat[i,j]<-G_prob[i]*(phi2-phi1)
+        #}else{
+        #}
+      }#close j
+      #calculate the probability of growing to that bin for the largest bin (as a plus group)
+      Tmat[i,nb]<-G_prob[i]*(1-phi2)
+
+    }#close normal if
+    ###############################
+    #Lognormal growth probabilities
+    ###############################
+    if(data_sdt$dist=="lognormal"){
+      Tmat[i,i]<-Tmat[i,i]+G_prob[i]*plnorm(binwd/2,log(G_mean[i]),G_sd[i],lower.tail = TRUE) #lobsters with little or no growth stay in the diagonal
+      for(j in (i+1):(nb-1)){
+        #calculate cumulative distribution to lower end of bin
+        phi1<-plnorm(bins[j]-bins[i]-binwd/2,log(G_mean[i]),G_sd[i],lower.tail = TRUE)
+        #calculate cumulative distribution to upper end of bin
+        phi2<-plnorm(bins[j+1]-bins[i]-binwd/2,log(G_mean[i]),G_sd[i])
+        #if(j<(nb-1)){
+          #calculate the probability of growing to that bin
+          Tmat[i,j]<-G_prob[i]*(phi2-phi1)
+        #}else{
+          
+        #}
+      }#close j
+      #calculate the probability of growing to that bin for the largest bin (as a plus group)
+      Tmat[i,nb]<-G_prob[i]*(1-phi2)
+    }#close lognormal if
+  }#close i
+  Tmat[nb-1,nb]<-G_prob[nb-1] #second to last row
+  Tmat[nb,nb]<-1 #stay in plus group
+  return(Tmat)
+}
+
+#Apply Bayes Theorem to calculate the probability of growth assuming tag loss rates
+correct_G_prob<-function(obs_G_prob,tag_reten_molt,tag_reten_nomolt){
+  p1<-obs_G_prob*tag_reten_nomolt/tag_reten_molt
+  p2<-1-obs_G_prob*(1-tag_reten_nomolt/tag_reten_molt)
+  
+  corrected_G_prob<-p1/p2
+  return(corrected_G_prob)
+}
+
+#calc variability around mean growth for simulating realized growth
+calcsimGvar<-function(bins,pr,gtm,xlo,xhi){
+  nbins=length(bins)
+  lflag=0
+  hflag=0
+  cumul=0
+  xlo=xlo
+  xhi=xhi
+  stcumullo=vector(length=pr)
+  stlowbin=vector(length=pr)
+  stcumulhigh=vector(length=pr)
+  sthighbin=vector(length=pr)
+  slplo=vector(length=pr)
+  slphi=vector(length=pr)
+  lowCI=vector(length=pr)
+  highCI=vector(length=pr)
+  
+  for(y in 1:pr){
+    cumul=cumsum(gtm[y,])
+    for(i in 1:nbins){
+      if(cumul[i]>xlo & lflag==0){
+        stcumullo[y]= cumul[i]
+        stlowbin[y]=midbins[i]
+        lflag=1
+        if(i>1){
+          slplo[y]=(cumul[i]-cumul[i-1])/(midbins[i]-midbins[i-1])
+          lowCI[y]=midbins[i-1]+(xlo-cumul[i-1])/slplo[y]
+        }else{lowCI[y]=0}
+      }
+      if(cumul[i]>xhi & hflag==0){
+        stcumulhigh[y]= cumul[i]
+        sthighbin[y]=midbins[i]
+        hflag=1
+        if(i>1){
+          slphi[y]=(cumul[i]-cumul[i-1])/(midbins[i]-midbins[i-1])
+          highCI[y]=midbins[i-1]+(xhi-cumul[i-1])/slphi[y]
+        }else{highCI[y]=0}
+      }
+    }
+    lflag=0
+    hflag=0
+    cumul=0
+  }
+  allvar=rbind(slplo,slphi,lowCI,highCI)
+  return(t(allvar))
+}
+
+```
+
+## Model
+
+```{r echo=FALSE}
+#| echo: false
+
+#Make model that includes growth probability as a function of size and DaL and temp
+#and accounts for selectivity
+est_growth_sdt<-function(parms){
+  #function to use "local" variable names for objects in parms and data.
+  getAll(parms,data_sdt)
+  
+  #data includes selectivity for each bin and the probability of retention for lobsters
+  #that grow and those that don't
+  
+  #calculate number of observations
+  n<-length(slength)
+  
+  #Make design matrix for logistic and linear models
+  X<-cbind(rep(1,n),slength,dal,temp)
+  
+  #make vectors of parameter estimates for logistic and linear models
+  #logistic for probability of growth
+  beta_logistic<-c(int_pg,beta_slength_pg,beta_dal_pg,beta_temp_pg)
+  #linear for amount of growth
+  beta_linear<-c(int_ag,beta_slength_ag,beta_dal_ag,beta_temp_ag)
+  
+  #backtransform log-scale parameters
+  cv<-exp(logcv)
+  
+  #Calculate actual probabilities of growth and amount of growth
+  #Logistic model for probability of growth
+  Y_pg<-linear(X,beta_logistic)
+  #G_prob<-dec_logistic(p1,p2,slength)
+  G_prob<-logistic_p(Y_pg)
+  #Calculate selectivity associated with the ending length of each lobster
+  Sel<-sel(slength+grow_yn*obs_inc,sel_int,sel_slope)
+  
+  #Calculate distribution of lobsters that grew
+  G_mean<-linear(X,beta_linear)
+  
+  #G_mean<-int+slope*slength
+  if(dist=="normal"){
+    G_sd<-G_mean*cv    #SD is proportional to mean growth
+    #rep(cv,n) #constant SD (independent of starting length)
+  }
+  if(dist=="lognormal"){
+    G_sd<-rep(cv,n) #cv is actually the log-scale SD
+  }
+  
+  #Calculate integral for probability of being observed (selectivity effect)
+  b<-length(lbins) #number of bins for calculating integral
+  p_obs_integral<-vector(mode="numeric",length=n)  #denominator for calculating combined effect of selectivity and growth on the probability of growth
+  p_G_amt<-vector(mode="numeric",length=b) #vector of the relative probability of observing a lobster at any potential length starting with the initial length (i.e., no growth) for the probability of growth
+  p_obs_integral_a<-vector(mode="numeric",length=n)  #denominator for calculating combined effect of selectivity and growth on the amount of growth
+  p_G_amt_a<-vector(mode="numeric",length=b) #vector of the relative probability of observing a lobster at any potential length starting with the initial length (i.e., no growth) for the amount of growth
+  
+  #calculate the probability of observing the growth amount for each lobster that grew
+  #Expected observed growth
+  e_obs_G_amt<-vector(mode="numeric",length=n)
+    
+  sd_obs_G_amt<-vector(mode="numeric",length=n)
+
+
+  for(i in 1:n){
+    selectivity<-sel(slength[i]+lbins,sel_int,sel_slope) #calculate selectivity
+    if(dist=="normal"){
+      #calculate quantities needed to compute integral of growth amount and selectivity
+      phi1<-pnorm(lbins[2],G_mean[i],G_sd[i])
+      p_G_amt[1]<-(1-G_prob[i])*phi1
+      p_G_amt_a[1]<-phi1
+
+      for(j in 2:(b-1)){
+        phi2<-pnorm(lbins[j],G_mean[i],G_sd[i])
+        p_G_amt[j]<-G_prob[i]*(phi2-phi1)
+        p_G_amt_a[j]<-phi2-phi1
+        phi1<-phi2
+      }
+      p_G_amt[b]<-1-sum(p_G_amt[1:(b-1)]) #clean up last bin
+      p_G_amt_a[b]<-1-sum(p_G_amt_a[1:(b-1)]) #clean up last bin
+    }
+    if(dist=="lognormal"){
+      #calculate quantities needed to compute integral of growth amount and selectivity
+      phi1<-pnorm(log(lbins[2]),log(G_mean[i]),G_sd[i])
+      p_G_amt[1]<-(1-G_prob[i])*phi1
+      p_G_amt_a[1]<-phi1
+
+      for(j in 2:(b-1)){
+        phi2<-pnorm(log(lbins[j]),log(G_mean[i]),G_sd[i])
+        p_G_amt[j]<-G_prob[i]*(phi2-phi1)
+        p_G_amt_a[j]<-phi2-phi1
+        phi1<-phi2
+      }
+      p_G_amt[b]<-1-sum(p_G_amt[1:(b-1)]) #clean up last bin
+      p_G_amt_a[b]<-1-sum(p_G_amt_a[1:(b-1)]) #clean up last bin
+      #p_obs_integral[i]<-selectivity%*%p_G_amt*lbin_wd #calculate product of selectivity and growth 
+      
+    }
+    p_obs_integral[i]<-selectivity%*%p_G_amt #calculate dot product of selectivity and growth 
+    p_obs_integral_a[i]<-selectivity%*%p_G_amt_a #calculate dot product of selectivity and growth
+    #calculate expected observed growth
+    e_obs_G_amt[i]<-sum(selectivity*p_G_amt_a*lbins)/p_obs_integral_a[i]
+    if(dist=="normal"){
+      #calculate sd of expected observed growth
+      sd_obs_G_amt[i]<-sqrt(sum(selectivity*p_G_amt_a*(lbins-e_obs_G_amt[i])^2))/p_obs_integral_a[i]
+    }
+    if(dist=="lognormal"){
+      #calculate sd of expected observed growth
+      sd_obs_G_amt[i]<-sqrt(sum(selectivity*p_G_amt_a*(log(lbins+0.01)-log(e_obs_G_amt[i]))^2))/p_obs_integral_a[i]
+    }
+  }
+
+  #binomial probability for observed growth  
+  #calculate the probability for each lobster and sum them for the negative log likelihood
+  #calculate observed probability of growth
+  p_obs_G<-p_obs_integral*G_prob/(p_obs_integral*G_prob + sel(slength,sel_int,sel_slope)*(1-G_prob))
+
+  nll_1<-0
+  for(i in 1:n){
+    nll_1<- nll_1-dbinom(grow_yn[i],size=1,p_obs_G[i],log=TRUE)
+  }
+  
+  #Normal or lognormal probability for growth increment of lobsters that grew
+  #calculate the nll for each lobster that grew and sum them for the negative log likelihood
+  
+  nll_2<-0
+  for(i in 1:n){
+    if(grow_yn[i]==1){ #only calculate for lobster that grew
+      if(dist=="normal"){
+        nll_2<- nll_2-dnorm(obs_inc[i],G_mean[i],G_sd[i],log=TRUE)-log(Sel[i])+log(p_obs_integral_a[i])
+      }
+      if(dist=="lognormal"){
+        nll_2<- nll_2-dnorm(log(obs_inc[i]),log(G_mean[i]),G_sd[i],log=TRUE)-log(Sel[i])+log(p_obs_integral_a[i])
+      }
+    }
+  }
+  
+  #Calculate mean growth and probability of growth for pre-specified length bins for use in growth transition
+  #matrices and 
+  #Probability of growth
+  nb<-length(plength)
+  X_st<-cbind(rep(1,nb),plength,rep(pdal,nb),rep(ptemp,nb))
+  Y_pgst<-linear(X_st,beta_logistic)
+  prob_growth<-logistic_p(Y_pgst)
+
+  #Amount of growth
+  amt_growth<-linear(X_st,beta_linear)
+  
+  #SD for amount of growth
+  if(dist=="normal"){
+      sd_growth<-amt_growth*cv    
+  }
+  if(dist=="lognormal"){
+      sd_growth<-rep(cv,nb)    
+  }
+
+  #Report mean growth probabilities and amount of growth  for making transition matrices
+  REPORT(prob_growth) #Probability of growing given size bin
+  REPORT(amt_growth) #Amount of growth given size bin, conditional on growing
+  REPORT(e_obs_G_amt) #expected amount of observed growth given selectivity effect
+  REPORT(sd_obs_G_amt) #expected amount of observed growth given selectivity effect
+  REPORT(sd_growth) #SD of growth
+  
+  #Report variables with SEs
+  ADREPORT(prob_growth)
+  ADREPORT(amt_growth)
+  ADREPORT(G_mean)
+  ADREPORT(G_prob)
+  ADREPORT(G_sd)
+  
+  #Report data
+  REPORT(slength)
+  REPORT(obs_inc)
+  REPORT(grow_yn)
+  
+  #Report parameters
+  REPORT(int_pg)
+  REPORT(beta_slength_pg)
+  REPORT(beta_dal_pg)
+  REPORT(beta_temp_pg)
+  REPORT(int_ag)
+  REPORT(beta_slength_ag)
+  REPORT(beta_dal_ag)
+  REPORT(beta_temp_ag)
+  REPORT(logcv)
+  
+  #Report estimates
+  REPORT(G_prob)
+  REPORT(G_mean)
+  REPORT(G_sd)
+  REPORT(p_obs_integral)
+  REPORT(p_obs_integral_a)
+  
+  #Report negative log likelihood
+  REPORT(nll_1)  
+  REPORT(nll_2)
+
+
+  #Joint negative log likelihood
+  negLL=nll_1+nll_2
+  
+  REPORT(negLL)
+  
+  #return the negative log likelihood
+  return(negLL)  
+}
+```
+
+## Run model and plot results - all scenarios
+
+```{r}
+#| echo: false
+
+#Run for each SU,sex, and season transition
+for(r in 1:nrow(runsmatrix)){
+  #print(paste("Starting row",r,sep=" "))
+  qtrtrans=runsmatrix[r,1]
+  dSex=runsmatrix[r,2]
+  dSU=runsmatrix[r,3]
+  mxinc=runsmatrix[r,4]
+  assmtGTM=paste(dSU,"_S",qtrtrans+1,"_", substr(dSex, 1, 1),sep="")
+
+if(qtrtrans==1&dSU=="GOMGBK"&dSex=="Female")assmtprob=GOMGBK_S2_F_probG
+if(qtrtrans==2&dSU=="GOMGBK"&dSex=="Female")assmtprob=GOMGBK_S3_F_probG
+if(qtrtrans==1&dSU=="GOMGBK"&dSex=="Male")assmtprob=GOMGBK_S2_M_probG
+if(qtrtrans==2&dSU=="GOMGBK"&dSex=="Male")assmtprob=GOMGBK_S3_M_probG
+if(qtrtrans==1&dSU=="SNE"&dSex=="Female")assmtprob=SNE_S2_F_probG
+if(qtrtrans==2&dSU=="SNE"&dSex=="Female")assmtprob=SNE_S3_F_probG
+if(qtrtrans==1&dSU=="SNE"&dSex=="Male")assmtprob=SNE_S2_M_probG
+if(qtrtrans==2&dSU=="SNE"&dSex=="Male")assmtprob=SNE_S3_M_probG
+  
+sel_parms<-subset(sel_p,region==dSU & sex==dSex)
+
+dat=filter(alltag,SU==dSU & Sex==dSex & seasspan ==qtrtrans)
+
+if(tolmeth==1){grow_yn<-ifelse(dat$SizeDiff>tol,1,0)} 
+if(tolmeth==2){grow_yn<-ifelse(dat$SizeDiff>(percCL*dat$TagCL),1,0)}
+
+lbin_wd <-1 #width of length bin for numerical integration of selectivity and growth
+data_sdt<-list(slength=dat$TagCL,
+              dal=dat$DaysAtLarge,
+              temp=dat$temp,#rep(1,length(dat$TagCL)),#dat$temp, OR rep(1,length(dat$TagCL)),
+              obs_inc=dat$SizeDiff,
+              grow_yn=grow_yn,
+              dist="lognormal", #Choose distribution for growth amount: "normal" or "lognormal"
+              #dist="normal",
+              plength=seq(55.5,225.5,5), #midpoints of bins for predicted probability and amount of growth for use in transition matrices 
+              #pdal=365/4, #days at large for predicted growth
+              pdal=ifelse(dSU=="GOMGBK",GOMGBK_meanDAL,SNE_meanDAL), #days at large for predicted growth, placeholder=365
+              ptemp=ifelse(dSU=="GOMGBK",GOMGBK_GDDmean,SNE_GDDmean), #temperature for predicted growth (placeholder=1)
+              lbin_wd=lbin_wd, #width of length bin for integration
+              lbins=as.numeric(seq(0,100,lbin_wd)), #length increments for integration for selectivity effects
+              sel_int=sel_parms$int, #intercept for selectivity function
+              sel_slope=sel_parms$slope #slope for selectivity function
+           )
+
+
+parms_sdt<-list(int_pg=0, #intercept for probability of growth
+               beta_slength_pg=-0.05, #starting length effect for probability of growth
+               beta_dal_pg=0.0, #days at large effect for probability of growth
+               beta_temp_pg=0.0, #temperature effect for probability of growth
+               int_ag=8.0, #intercept for amount of growth
+               beta_slength_ag=0.0, #starting length effect for amount of growth
+               beta_dal_ag=0.0, #days at large effect for amount of growth
+               beta_temp_ag=0.0, #temperature effect for amount of growth
+               logcv=log(0.1) #CV parameter for amount of growth - CV if dist=normal, log-scale SD if dist=lognormal
+            )
+
+parms_est_sdt<-list(int_pg=as.factor(1), #intercept for probability of growth
+               beta_slength_pg=as.factor(1), #starting length effect for probability of growth
+               beta_dal_pg=as.factor(1), #days at large effect for probability of growth
+               beta_temp_pg=as.factor(1), #temperature effect for probability of growth
+               int_ag=as.factor(1), #intercept for amount of growth
+               beta_slength_ag=as.factor(1), #starting length effect for amount of growth
+               beta_dal_ag=as.factor(1), #days at large effect for amount of growth
+               beta_temp_ag=as.factor(1), #temperature effect for amount of growth
+               logcv=as.factor(1) #CV parameter for amount of growth - CV if dist=normal, log-scale SD if dist=lognormal
+            )
+
+#####################
+
+#call make adm function
+obj_sdt<-MakeADFun(est_growth_sdt, parms_sdt, map = parms_est_sdt)
+
+#run model
+opt_sdt<- nlminb(obj_sdt$par, 
+             obj_sdt$fn, 
+             obj_sdt$gr, 
+             control = list(eval.max = 200000, iter.max=200000),
+             lower = -50,
+             upper = 50) #estimate parameters
+
+#Get report
+res<-obj_sdt$report()
+#Get SEs
+sdr <- sdreport(obj_sdt)
+opt_sdt
+
+runsmatrix[r,7]=opt_sdt$convergence
+
+#####################
+
+if(pdfyn==1){pdf(file=paste(paste(dSU,dSex,qtrtrans+1,sh_lg,sep="_"),".pdf",sep=""))}
+
+#Plot probability of growing with data
+pdat1<-data.frame(cbind(data_sdt$slength,res$G_prob))
+pdat2<-data.frame(cbind(data_sdt$slength,data_sdt$grow_yn))
+names(pdat1)<-c("length","gprob")
+names(pdat2)<-c("length","gprob")
+nsampg=colSums(pdat2[2])
+nsampng=nrow(pdat2)-nsampg
+
+plot1<-ggplot(data=pdat2,aes(x=as.numeric(length),y=as.numeric(gprob)))+
+  geom_point()+
+  geom_smooth(data=pdat1,aes(x=length,y=gprob),se=FALSE,linewidth=1.2,color="black")+
+  #geom_line(data=assmtprob,aes(x,y,col="ASMFC 2025"),linetype="dashed",linewidth=1.2)+
+  #geom_line(data=pdat1,aes(x=length,y=gprob))+ #shows DAL effect but hard to read
+  #scale_color_manual(name = "",values = c("Model" = "black", "ASMFC 2025" = "blue")) +
+  theme_classic(base_size = 25)+
+  #theme(legend.position = "bottom",legend.text = element_text(size = 25))+ 
+  xlab("Carapace length (mm)")+
+  ylab("Probability of growing")+
+  ylim(0,1)+
+  xlim(50,max(data_sdt$slength))
+print(plot1)
+
+#predicted growth (if grew) corrected for "selectivity"
+obs<-data.frame(cbind(data_sdt$slength,data_sdt$obs_inc))
+est<-data.frame(cbind(data_sdt$slength,res$e_obs_G_amt))
+names(obs)<-c("length","increment")
+names(est)<-c("length","increment")
+if(data_sdt$dist=="normal"){
+  boundsp1<-data.frame(cbind(data_sdt$slength,res$e_obs_G_amt+1.96*res$sd_obs_G_amt))
+  boundsp2<-data.frame(cbind((data_sdt$slength),(res$e_obs_G_amt-1.96*res$sd_obs_G_amt)))
+}
+if(data_sdt$dist=="lognormal"){
+  #These might not be right for the CIs
+  boundsp1<-data.frame(cbind(data_sdt$slength,exp(log(res$e_obs_G_amt)+1.96*res$sd_obs_G_amt)))
+  boundsp2<-data.frame(cbind((data_sdt$slength),(exp(log(res$e_obs_G_amt)-1.96*res$sd_obs_G_amt))))
+}
+names(boundsp1)<-c("length","increment")
+names(boundsp2)<-c("length","increment")
+boundsp1<-boundsp1[which(data_sdt$grow_yn==1),]
+boundsp2<-boundsp2[which(data_sdt$grow_yn==1),]
+bounds2<-cbind(boundsp1,boundsp2)
+bounds<-rbind(boundsp1[order(boundsp1$length),],(boundsp2[order(-boundsp2$length),]))
+
+plot2<-ggplot(data=obs[which(data_sdt$grow_yn==1),],aes(x=length,y=increment))+
+  geom_point()+
+  geom_smooth(data=est,aes(x=length,y=increment),se=FALSE,color="black")+
+  #geom_line(data=est,aes(x=length,y=increment))+ #shows DAL effect but hard to read
+  theme_classic(base_size = 25)+
+  geom_polygon(data=bounds,aes(x=length,y=increment),fill="slategray",alpha=0.2)+
+  xlab("Carapace length (mm)")+
+  ylab("Growth increment (mm)")+
+  xlim(50,max(data_sdt$slength))+
+  ylim(0,mxinc)
+print(plot2)
+
+#Partial effects plots (probability of growth & increment if grow given CL, DAL, GDD)
+slen<-seq(55.5,225.5,5)
+n<-length(slen)
+dal<-seq(min(data_sdt$dal),max(data_sdt$dal),(max(data_sdt$dal)-min(data_sdt$dal))/(n-1))
+temps<-seq(min(data_sdt$temp),max(data_sdt$temp),(max(data_sdt$temp)-min(data_sdt$temp))/(n-1))
+Xlen<-cbind(rep(1,n),slen,rep(mean(dal),n),rep(mean(temps),n))
+Xdal<-cbind(rep(1,n),rep(mean(slen),n),dal,rep(mean(temps),n))
+Xtemp<-cbind(rep(1,n),rep(mean(slen),n),rep(mean(dal),n),temps)
+beta_P<-c(res$int_pg,res$beta_slength_pg,res$beta_dal_pg,res$beta_temp_pg)
+beta_G<-c(res$int_ag,res$beta_slength_ag,res$beta_dal_ag,res$beta_temp_ag)
+
+Plen<-logistic_p(linear(Xlen,beta_P))
+Pdal<-logistic_p(linear(Xdal,beta_P))
+Glen<-linear(Xlen,beta_G)
+Gdal<-linear(Xdal,beta_G)
+Gtemp<-linear(Xtemp,beta_G)
+pelens<-cbind(slen,Plen,Glen);colnames(pelens)<-c("slen","Plen","Glen")
+pedals<-cbind(dal,Pdal,Gdal);colnames(pedals)<-c("dal","Pdal","Gdal")
+
+g1<-ggplot(pelens,aes(slen,Plen))+geom_point()+
+  xlab("Carapace length (mm)")+
+  ylab("Probability of growing")+
+  theme_classic()+
+  xlim(55.5,225.5)+
+  ylim(0,1)+ 
+  theme(text = element_text(size = 18))
+g2<-ggplot(pelens,aes(slen,Glen))+geom_point()+
+  xlab("Carapace length (mm)")+
+  ylab("Growth increment (mm CL)")+
+  theme_classic()+
+  xlim(55.5,225.5)+
+  ylim(0,30)+ 
+  theme(text = element_text(size = 18))
+grid.arrange(g1,g2,nrow=1)
+
+if(!(is.na(parms_est_sdt$beta_dal_pg))&!(is.na(parms_est_sdt$beta_dal_ag))){
+g3<-ggplot(pedals,aes(dal,Pdal))+geom_line()+
+  xlab("")+
+  ylab("Probability of growing")+
+  theme_classic()+
+  xlim(0,max(data_sdt$dal))+
+  ylim(0,1)+ 
+  theme(text = element_text(size = 18))
+g4<-ggplot(pedals,aes(dal,Gdal))+geom_line()+
+  xlab("Days at large")+
+  ylab("Growth increment (mm CL)")+
+  theme_classic() +
+  xlim(0,max(data_sdt$dal))+
+  ylim(0,30)+ 
+  theme(text = element_text(size = 18))
+grid.arrange(g3,g4,nrow=2)
+}
+
+if(usetemp==1){
+g5<-ggplot(pedals,aes(temps,Pdal))+geom_line()+
+  xlab("")+
+  ylab("Probability of growing")+
+  theme_classic()+
+  xlim(min(Xtemp),max(data_sdt$temp))+
+  ylim(0,1)+ theme(text = element_text(size = 18))
+g6<-ggplot(pedals,aes(temps,Gdal))+geom_line()+
+  xlab("Growing degree days (scaled to maximum)")+
+  ylab("Growth increment (mm CL)")+
+  theme_classic() +
+  xlim(min(Xtemp),max(data_sdt$temp))+
+  ylim(0,30)+ theme(text = element_text(size = 18))
+grid.arrange(g5,g6,nrow=2)
+}
+
+#Plot standardized expected observed residuals for lobsters that grew
+if(data_sdt$dist=="normal"){
+  residual<-ifelse(data_sdt$obs_inc>tol,data_sdt$obs_inc,NA)-res$e_obs_G_amt
+}
+if(data_sdt$dist=="lognormal"){
+  residual<-ifelse(data_sdt$obs_inc>tol,log(data_sdt$obs_inc),NA)-log(res$e_obs_G_amt)
+}
+plot(x=data_sdt$slength,y=residual/res$sd_obs_G_amt,
+     xlab="Carapace length (mm)",
+     ylab="Standardized residuals",
+     pch = 19, 
+     main = "", 
+     cex = 1.5,      
+     cex.lab = 1.5,  
+     cex.axis = 1.2
+     );abline(h=0,lwd=2)
+
+#QQ plot for standardized growth residuals
+qqnorm(residual/res$sd_obs_G_amt,
+       pch=19,
+       main="",
+       cex = 1.5,      
+       cex.lab = 1.5,  
+       cex.axis = 1.2);qqline(residual/res$sd_obs_G_amt,lwd=2)
+
+plotGcomp<-ggplot(data=get(runsmatrix[r,5]),aes(x=as.numeric(x),y=as.numeric(y),color="ASMFC 2025"))+
+  geom_line(linetype = "dashed")+
+  geom_smooth(data=pdat1,aes(x=length,y=gprob,color="Model"),se=FALSE,linetype="solid",linewidth=1.1)+
+  scale_color_manual(name = "",values = c("Model" = "black", "ASMFC 2025" = "blue")) +
+  theme_classic(base_size = 25)+
+  theme(legend.position = "bottom",
+    legend.text = element_text(size = 25))+ 
+  xlab("Carapace length (mm)")+
+  ylab("Probability of growing")+
+  ylim(0,1)+
+  xlim(50,230)
+print(plotGcomp)
+
+plotIcomp<-ggplot(data=get(runsmatrix[r,6]),aes(x=as.numeric(x),y=as.numeric(y),color="ASMFC 2025"))+
+  geom_line(linetype = "dashed")+
+  geom_smooth(data=est,aes(x=length,y=increment,color="Model"),se=FALSE,linetype="solid",linewidth=1.1)+
+  scale_color_manual(name = "",values = c("Model" = "black", "ASMFC 2025" = "blue")) +
+  theme_classic(base_size = 25)+
+  theme(legend.position = "bottom",
+    legend.text = element_text(size = 25))+ 
+  xlab("Carapace length (mm)")+
+  ylab("Growth increment (mm)")+
+  xlim(50,230)+
+  ylim(5,25)
+print(plotIcomp)
+
+#Contour plots of growth by DAL and GDD for four example lengths (middle of bins specified below)
+if(usetemp==1){
+pred_beta_logistic<-c(res$int_pg,res$beta_slength_pg,res$beta_dal_pg,res$beta_temp_pg)
+pred_beta_linear<-c(res$int_ag,res$beta_slength_ag,res$beta_dal_ag,res$beta_temp_ag)
+pred_lengths<-midbins[c(1,7,14,21)]
+pred_lengths_names<-c("Bin1","Bin2","Bin3","Bin4")
+ predvals <- expand.grid(
+  dal<-seq(min(dat$DaysAtLarge),max(dat$DaysAtLarge),length.out=10),
+  temp<-seq(min(dat$temp),max(dat$temp),length.out=10)
+ );colnames(predvals)<-c("DAL","sGDD")
+ 
+allpred<-matrix(0,nrow(predvals),5)
+for(b in 1:length(pred_lengths)){
+ predvals2<-as.matrix(cbind(rep(1,nrow(predvals)),rep(pred_lengths[b],nrow(predvals)),predvals));colnames(predvals2)<-c(
+  "c1","CL","DAL","sGDD")
+ estps<-linlog(predvals2,pred_beta_logistic);colnames(estps)<-"est_prob"
+ estgs<-linear(predvals2,pred_beta_linear);colnames(estgs)<-"est_inc"
+ if(b==1){allpred<-data.frame(cbind(predvals2[,-1],estps,estgs))}
+    else{allpred<-rbind(allpred,data.frame(cbind(predvals2[,-1],estps,estgs)))}
+}
+
+my_breaks <- c(0,0.25,0.5,0.75,1)
+predp<-ggplot(allpred,aes(x = sGDD, y = DAL, z = est_prob)) +
+geom_contour_filled(breaks = my_breaks) +
+  geom_contour(color = "white", alpha = 0.5) + 
+  labs(title = " ",
+       fill = "Probability of growth") +
+  theme_classic(base_size = 10)+
+  theme(legend.position = "bottom")+
+  facet_wrap(~factor(CL))
+print(predp)
+
+my_breaks<-pretty(allpred$est_inc, n = 4)
+#seq(floor(min(allpred$est_inc)),ceiling(max(allpred$est_inc)),2)
+predg<-ggplot(allpred, aes(x = sGDD, y = DAL, z = est_inc)) +
+  geom_contour_filled(breaks = my_breaks) +
+  geom_contour(color = "white", alpha = 0.5,breaks = my_breaks) + 
+  labs(title = " ",
+       fill = "Growth increment") +
+  theme_classic(base_size = 10)+  
+  theme(legend.position = "bottom")+
+  scale_fill_viridis_d(drop = FALSE)+
+  facet_wrap(~factor(CL))
+print(predg)
+}
+
+#####################
+#Generate growth transition matrix
+
+#calculate G_prob for the midpoint of each bin
+G_prob<-res$prob_growth
+G_mean<-res$amt_growth
+G_mean<-ifelse(G_mean<0,0.01,G_mean)
+G_sd<-res$sd_growth
+Tmat<-make_trans_matrix(G_prob,G_mean,G_sd,bins,binw)
+
+#Calc corrected GTMs for tag loss
+
+#Using data from Rowe and Haedrich (2001) streamer tag study
+#Calculate the probability of tag retention through a molt
+#prob_reten_given_molt<-1-0.4 #Streamer tags: P. 517 last paragraph left column (N=20) 
+prob_reten_given_molt<-1-0.217 #T-bar European lobs + Josh NH
+#Probability of tag retention for lobsters that did not molt
+#prob_reten_given_no_molt<-1-(24+7)/(135+63) #Streamer tags: calculated from lobsters that lost tag in spring (no growth) and lobsters that did not grow from spring to fall and lost tag
+prob_reten_given_no_molt<-1-0.06 #T-bar: Gonzalez-Vincente et al. European lobs
+#Calculate growth probabilities corrected for molting
+c_G_prob<-correct_G_prob(G_prob,prob_reten_given_molt,prob_reten_given_no_molt)
+
+#Make data frame for plotting corrected and uncorrected growth probabilities
+pdat<-data.frame(cbind(data_sdt$plength,G_prob,c_G_prob))
+names(pdat)<-c("length","original","corrected")
+pdat<-gather(pdat,key="Type",value="G_prob",2:3)
+ggplot(data=pdat,aes(x=length,y=G_prob,color=Type))+
+   geom_line()+
+   ylab("Growth probability")+
+   xlab("Length (mm)")
+
+#make corrected GTM 
+TmatC<-make_trans_matrix(c_G_prob,G_mean,G_sd,bins,binw)
+
+run_name=paste(paste(dSU,dSex,qtrtrans+1,sh_lg,sep="_"),".csv",sep="")
+write.csv(TmatC,run_name,row.names=FALSE)
+runsmatrix[r,8]=run_name
+names(runsmatrix)[8]="Run_name"
+dev.off()
+} #loop across runsmatrix
+
+names(runsmatrix)[7]="store_convc"
+
+```
+
+## Simulate growth
+
+```{r}
+#| echo: false
+
+if(pdfyn==1){pdf(file=paste(paste(sh_lg,"_simG",sep=""),".pdf",sep=""))}
+
+#assmt growth GOMGBK
+assmtfGg<-array(0,c(length(bins),length(bins),4))
+assmtfGg[,,1]=diag(length(bins))
+assmtfGg[,,2]=GOMGBK_S2_F
+assmtfGg[,,3]=GOMGBK_S3_F
+assmtfGg[,,4]=diag(length(bins))
+assmtmGg<-array(0,c(length(bins),length(bins),4))
+assmtmGg[,,1]=diag(length(bins))
+assmtmGg[,,2]=GOMGBK_S2_M
+assmtmGg[,,3]=GOMGBK_S3_M
+assmtmGg[,,4]=diag(length(bins))
+
+pr=50
+fN<-matrix(0,nrow=pr,ncol=length(bins)) #Female N matrix
+fN[1,1]=100 #Populate N matrix with initial # in first bin
+mN<-matrix(0,nrow=pr,ncol=length(bins)) #Female N matrix
+mN[1,1]=100 #Populate N matrix with initial # in first bin
+
+#Populate remaining N matrix
+for(t in 1:(pr-1)){
+    s2=fN[t,]%*%assmtfGg[,,2]
+    fN[t+1,]=s2%*%assmtfGg[,,3]
+}
+for(t in 1:(pr-1)){
+    s2=mN[t,]%*%assmtmGg[,,2]
+    mN[t+1,]=s2%*%assmtmGg[,,3]
+}
+colnames(fN)=midbins;colnames(mN)=midbins
+
+timeseries=seq(1,pr,1)
+ftmp2=fN/rowSums(fN) #rowSums(ftmp2)      
+ftmp3=(ftmp2%*%midbins)    
+mtmp2=mN/rowSums(mN) #rowSums(mtmp2)      
+mtmp3=(mtmp2%*%midbins)    
+
+fmeanLAA=data.frame(ftmp3,rep("Female",pr));colnames(fmeanLAA)=c("Mean","Sex")
+mmeanLAA=data.frame(mtmp3,rep("Male",pr));colnames(mmeanLAA)=c("Mean","Sex")
+alldat=rbind(fmeanLAA,mmeanLAA);alldat$Year=rep(timeseries,2)
+alldat$Source="ASMFC 2025"
+Galldat=alldat
+
+FvarAss<-calcsimGvar(bins,pr,fN,5,95)
+MvarAss<-calcsimGvar(bins,pr,mN,5,95)
+
+#ggplot(alldat,aes(Year,Mean))+geom_line()+labs(x='Year', y='Length (mm)')+theme_classic(base_size =14)+ scale_x_continuous(breaks = seq(0, pr, by = 10))+ scale_y_continuous(breaks = seq(0, 250, by = 50))+facet_wrap(~Sex)+ggtitle("GOMGBK Assessment")+facet_wrap(~Sex)+geom_vline(xintercept = 7, color="red")+geom_point(data=as.data.frame(filter(SNEage,SU=="GOMGBK")),aes(x=agematch,y=CL))
+
+#Wilberg
+#use GTM to grow initial pulse of recruits in 53mm bin out pr years
+estfGg<-array(0,c(length(bins),length(bins),4))
+estfGg[,,1]=diag(length(bins))
+estfGg[,,2]=as.matrix(read.csv(paste("GOMGBK_Female_2_",sh_lg,".csv",sep="")))
+estfGg[,,3]=diag(length(bins))#as.matrix(read.csv(paste("GOMGBK_Female_3_",sh_lg,".csv",sep="")))
+estfGg[,,4]=diag(length(bins))
+estmGg<-array(0,c(length(bins),length(bins),4))
+estmGg[,,1]=diag(length(bins))
+estmGg[,,2]=as.matrix(read.csv(paste("GOMGBK_Male_2_",sh_lg,".csv",sep="")))
+estmGg[,,3]=diag(length(bins))#as.matrix(read.csv(paste("GOMGBK_Male_3_",sh_lg,".csv",sep="")))
+estmGg[,,4]=diag(length(bins))
+
+#create growmat.txt file for input into UMM assessment code
+growmatGOMGBK=rbind(estfGg[,,1],estmGg[,,1],estfGg[,,2],estmGg[,,2],estfGg[,,3],estmGg[,,3],estfGg[,,4],estmGg[,,4])
+write.table(growmatGOMGBK,paste("GTM_GOMGBK_",sh_lg,".dat",sep=""),quote=FALSE,col.names=FALSE,row.names=FALSE)
+write("-1234",file=paste("GTM_GOMGBK_",sh_lg,".dat",sep=""),append=TRUE)
+
+pr=50
+fN<-matrix(0,nrow=pr,ncol=length(bins)) #Female N matrix
+fN[1,1]=100 #Populate N matrix with initial # in first bin
+mN<-matrix(0,nrow=pr,ncol=length(bins)) #Female N matrix
+mN[1,1]=100 #Populate N matrix with initial # in first bin
+
+#Populate remaining N matrix
+for(t in 1:(pr-1)){
+    s2=fN[t,]%*%estfGg[,,2]
+    fN[t+1,]=s2%*%estfGg[,,3]
+}
+for(t in 1:(pr-1)){
+    s2=mN[t,]%*%estmGg[,,2]
+    mN[t+1,]=s2%*%estmGg[,,3]
+}
+midbins<-seq(55.5,225.5,5)
+colnames(fN)=midbins;colnames(mN)=midbins
+
+timeseries=seq(1,pr,1)
+ftmp2=fN/rowSums(fN) #rowSums(ftmp2)      
+ftmp3=(ftmp2%*%midbins)    
+mtmp2=mN/rowSums(mN) #rowSums(mtmp2)      
+mtmp3=(mtmp2%*%midbins)    
+
+fmeanLAA=data.frame(ftmp3,rep("Female",pr));colnames(fmeanLAA)=c("Mean","Sex")
+mmeanLAA=data.frame(mtmp3,rep("Male",pr));colnames(mmeanLAA)=c("Mean","Sex")
+alldat=rbind(fmeanLAA,mmeanLAA);alldat$Year=rep(timeseries,2)
+alldat$Source="Model"
+alldat=rbind(alldat,Galldat)
+alldat$Source=as.factor(alldat$Source)
+
+myColors <- c("black","blue")
+names(myColors) <- levels(alldat$grp)
+colScale <- scale_colour_manual(name = "Growth model",values = myColors)
+
+FvarWilberg<-calcsimGvar(bins,pr,fN,5,95)
+MvarWilberg<-calcsimGvar(bins,pr,mN,5,95)
+
+corridor<-data.frame(
+  yr=alldat$Year,
+  ymin=c(FvarWilberg[,3],MvarWilberg[,3],FvarAss[,3],MvarAss[,3]),
+  ymax=c(FvarWilberg[,4],MvarWilberg[,4],FvarAss[,4],MvarAss[,4])
+)
+corridor[corridor==0]<-53
+alldat2=cbind(alldat,corridor)
+
+plotG<-ggplot(filter(alldat2, Year <= 20), aes(Year, Mean, group = Source, color = Source, fill = Source, linetype = Source)) +
+  geom_line(size = 1.25) + 
+  geom_ribbon(aes(ymin = ymin, ymax = ymax), alpha = 0.1, color = NA) + # Added color=NA to remove ribbon outlines
+  labs(x = ' ', y = 'Length (mm CL)', color = NULL, linetype = NULL, fill = NULL) + # Setting to NULL removes the titles
+  theme_classic(base_size = 14) + 
+  scale_x_continuous(breaks = seq(0, 20, by = 5)) + 
+  scale_y_continuous(breaks = seq(0, 200, by = 50)) +
+  scale_color_brewer(palette = "Set1") + 
+  scale_fill_brewer(palette = "Set1") +  
+  facet_wrap(~Sex) + 
+  theme(text = element_text(size = 20), legend.title = element_blank()) +
+  theme(legend.position = "none",legend.text = element_text(size = 18))+ 
+  geom_hline(yintercept = 84, col = "black", linetype = "dashed")+
+  geom_point(GOMGBKage,mapping=aes(x=Year,y=Mean))+
+  #ggtitle("GOMGBK")+
+  theme(
+     text = element_text(size = 18),
+     plot.title = element_text(hjust = 0.5), # Centers the title
+     legend.title = element_blank()
+  )
+
+
+#######
+
+#assmt growth SNE
+assmtfSg<-array(0,c(length(bins),length(bins),4))
+assmtfSg[,,1]=diag(length(bins))
+assmtfSg[,,2]=SNE_S2_F
+assmtfSg[,,3]=SNE_S3_F
+assmtfSg[,,4]=diag(length(bins))
+assmtmSg<-array(0,c(length(bins),length(bins),4))
+assmtmSg[,,1]=diag(length(bins))
+assmtmSg[,,2]=SNE_S2_M
+assmtmSg[,,3]=SNE_S3_M
+assmtmSg[,,4]=diag(length(bins))
+
+pr=50
+fN<-matrix(0,nrow=pr,ncol=length(bins)) #Female N matrix
+fN[1,1]=100 #Populate N matrix with initial # in first bin
+mN<-matrix(0,nrow=pr,ncol=length(bins)) #Female N matrix
+mN[1,1]=100 #Populate N matrix with initial # in first bin
+
+#Populate remaining N matrix
+for(t in 1:(pr-1)){
+    s2=fN[t,]%*%assmtfSg[,,2]
+    fN[t+1,]=s2%*%assmtfSg[,,3]
+}
+for(t in 1:(pr-1)){
+    s2=mN[t,]%*%assmtmSg[,,2]
+    mN[t+1,]=s2%*%assmtmSg[,,3]
+}
+colnames(fN)=midbins;colnames(mN)=midbins
+
+timeseries=seq(1,pr,1)
+ftmp2=fN/rowSums(fN) #rowSums(ftmp2)
+ftmp3=(ftmp2%*%midbins)
+mtmp2=mN/rowSums(mN) #rowSums(mtmp2)
+mtmp3=(mtmp2%*%midbins)
+
+fmeanLAA=data.frame(ftmp3,rep("Female",pr));colnames(fmeanLAA)=c("Mean","Sex")
+mmeanLAA=data.frame(mtmp3,rep("Male",pr));colnames(mmeanLAA)=c("Mean","Sex")
+alldat=rbind(fmeanLAA,mmeanLAA);alldat$Year=rep(timeseries,2)
+alldat$Source="ASMFC 2025"
+Salldat=alldat
+
+FvarAss<-calcsimGvar(bins,pr,fN,5,95)
+MvarAss<-calcsimGvar(bins,pr,mN,5,95)
+
+#Wilberg
+estfSg<-array(0,c(length(bins),length(bins),4))
+estfSg[,,1]=diag(length(bins))
+estfSg[,,2]=as.matrix(read.csv(paste("SNE_Female_2_",sh_lg,".csv",sep="")))
+estfSg[,,3]=diag(length(bins))#as.matrix(read.csv(paste("SNE_Female_3_",sh_lg,".csv",sep="")))
+estfSg[,,4]=diag(length(bins))
+estmSg<-array(0,c(length(bins),length(bins),4))
+estmSg[,,1]=diag(length(bins))
+estmSg[,,2]=as.matrix(read.csv(paste("SNE_Male_2_",sh_lg,".csv",sep="")))
+estmSg[,,3]=diag(length(bins))#as.matrix(read.csv(paste("SNE_Male_3_",sh_lg,".csv",sep="")))
+estmSg[,,4]=diag(length(bins))
+
+#create growmat.txt file for input into UMM assessment code
+growmatSNE=rbind(estfSg[,,1],estmSg[,,1],estfSg[,,2],estmSg[,,2],estfSg[,,3],estmSg[,,3],estfSg[,,4],estmSg[,,4])
+write.table(growmatGOMGBK,paste("GTM_SNE_",sh_lg,".dat",sep=""),quote=FALSE,col.names=FALSE,row.names=FALSE)
+write("-1234",file=paste("GTM_SNE_",sh_lg,".dat",sep=""),append=TRUE)
+
+
+pr=50
+fN<-matrix(0,nrow=pr,ncol=length(bins)) #Female N matrix
+fN[1,1]=100 #Populate N matrix with initial # in first bin
+mN<-matrix(0,nrow=pr,ncol=length(bins)) #Female N matrix
+mN[1,1]=100 #Populate N matrix with initial # in first bin
+
+#Populate remaining N matrix
+for(t in 1:(pr-1)){
+    s2=fN[t,]%*%estfSg[,,2]
+    fN[t+1,]=s2%*%estfSg[,,3]
+}
+for(t in 1:(pr-1)){
+    s2=mN[t,]%*%estmSg[,,2]
+    mN[t+1,]=s2%*%estmSg[,,3]
+}
+colnames(fN)=midbins;colnames(mN)=midbins
+
+timeseries=seq(1,pr,1)
+ftmp2=fN/rowSums(fN) #rowSums(ftmp2)
+ftmp3=(ftmp2%*%midbins)
+mtmp2=mN/rowSums(mN) #rowSums(mtmp2)
+mtmp3=(mtmp2%*%midbins)
+
+fmeanLAA=data.frame(ftmp3,rep("Female",pr));colnames(fmeanLAA)=c("Mean","Sex")
+mmeanLAA=data.frame(mtmp3,rep("Male",pr));colnames(mmeanLAA)=c("Mean","Sex")
+alldat=rbind(fmeanLAA,mmeanLAA);alldat$Year=rep(timeseries,2)
+alldat$Source="Model"
+alldat=rbind(alldat,Salldat)
+alldat$Source=as.factor(alldat$Source)
+
+myColors <- c("black","blue")
+names(myColors) <- levels(alldat$grp)
+colScale <- scale_colour_manual(name = "Growth model",values = myColors)
+
+FvarWilberg<-calcsimGvar(bins,pr,fN,5,95)
+MvarWilberg<-calcsimGvar(bins,pr,mN,5,95)
+
+corridor<-data.frame(
+  yr=alldat$Year,
+  ymin=c(FvarWilberg[,3],MvarWilberg[,3],FvarAss[,3],MvarAss[,3]),
+  ymax=c(FvarWilberg[,4],MvarWilberg[,4],FvarAss[,4],MvarAss[,4])
+)
+corridor[corridor==0]<-53
+alldat2=cbind(alldat,corridor)
+
+plotS<-ggplot(filter(alldat2, Year <= 20), aes(Year, Mean, group = Source, color = Source, fill = Source, linetype = Source)) +
+  geom_line(size = 1.25) + 
+  geom_ribbon(aes(ymin = ymin, ymax = ymax), alpha = 0.1, color = NA) + 
+  labs(x = 'Year', y = 'Length (mm CL)', color = NULL, linetype = NULL, fill = NULL) + 
+  theme_classic(base_size = 14) + 
+  scale_x_continuous(breaks = seq(0, 20, by = 5)) + 
+  scale_y_continuous(breaks = seq(0, 200, by = 50)) +
+  scale_color_brewer(palette = "Set1") + 
+  scale_fill_brewer(palette = "Set1") +  
+  facet_wrap(~Sex) + 
+  theme(text = element_text(size = 20), legend.title = element_blank()) +
+  theme(legend.position = "bottom",legend.text = element_text(size = 18))+ 
+  geom_hline(yintercept = 84, col = "black", linetype = "dashed")+
+  geom_point(SNEage,mapping=aes(x=Year,y=Mean))+
+  #ggtitle("SNE")+
+  theme(
+     text = element_text(size = 18),
+     plot.title = element_text(hjust = 0.5), # Centers the title
+     legend.title = element_blank()
+  )
+# Combine them: "/" stacks them, "+" puts them side-by-side and 'guides = "collect"' gathers the legends into one
+(plotG / plotS) + plot_layout(guides = "collect") & theme(legend.position = 'bottom')
+
+if(pdfyn==1){dev.off()}
+
+```
+
+## Simulate tag loss and selectivity
+
+Used to sim test code above.
+
+```{r}
+#| echo: false
+#Simulation code to create data set for determining effects of tag loss and selectivity
+if(doselsims==1){
+
+#function to simulate data 
+#G_prob_beta is the vector of parameters for the logistic function for growth probability
+  # (intercept, slope for CL, slope for DAL)
+#G_amt_beta is the vector of parameters for the linear function for amount of growth
+  #(intercept,slope for CL, slope for DAL, log-scale SD)
+#X is the design matrix with 1s for the intercept and starting length (L0) and days at large (DaL)
+#sel_p is a vector of the selectivity parameters
+#f is the fishing mortality rate for fully selected sizes
+#tag_reten_G is the probability of retaining a tag if the lobster grew
+#tag_reten_N is the probability of retaining a tag if the lobster did not grow
+#dist "normal" or "lognormal" fo rthe growth amount distribution
+simulate_lobster_G<-function(G_prob_beta,G_amt_beta,cv,X,f,tag_reten_G,tag_reten_N,dist,sel_int,sel_slope){
+  n=nrow(X)
+
+    #make vectors of parameter estimates for logistic and linear models
+    #logistic for probability of growth
+    int_pg<-G_prob_beta[1]
+    beta_slength_pg<-G_prob_beta[2]
+    beta_dal_pg<-G_prob_beta[3]
+    beta_temp_pg<-0
+    beta_logistic<-c(int_pg,beta_slength_pg,beta_dal_pg,beta_temp_pg)
+      
+    #linear for amount of growth
+    int_ag<-G_amt_beta[1]
+    beta_slength_ag<-G_amt_beta[2]
+    beta_dal_ag<-G_amt_beta[3]
+    beta_temp_ag<-0
+
+    beta_linear<-c(int_ag,beta_slength_ag,beta_dal_ag,beta_temp_ag)
+  
+    #CV of growth amount
+    cv<-cv
+  
+    #Logistic model for probability of growth
+    Y_pg<-linear(X,beta_logistic)
+    G_prob<-logistic_p(Y_pg)
+  
+    #Calculate distribution of lobsters that grew
+    G_mean<-linear(X,beta_linear)
+    #G_mean<-int+slope*slength
+    if(dist=="normal"){
+      G_sd<-G_mean*cv    #SD is proportional to mean growth
+    }
+    if(dist=="lognormal"){
+      G_sd<-rep(cv,n) #cv is actually the log-scale SD
+    }
+
+  #Make data set
+  g_yn<-vector(mode="numeric",length=n)
+  G_amt<-rep(0,length=n)
+  end_L<-vector(mode="numeric",length=n)
+  c_yn<-vector(mode="numeric",length=n)
+  tag_yn<-vector(mode="numeric",length=n)
+  p_catch<-vector(mode="numeric",length=n)
+  sta_L<-X[,2] #starting length
+  DaL<-X[,3] #Days at large
+  #Grow lobsters
+  for(i in 1:n){
+    g_yn[i]<-rbinom(1,1,G_prob[i])
+    if(g_yn[i]==1){ #lobster grows!
+      if(dist=="normal"){
+        G_amt[i]<-rnorm(1,mean=G_mean[i],sd=G_sd[i])
+      }
+      if(dist=="lognormal"){
+        G_amt[i]<-exp(rnorm(1,mean=log(G_mean[i]),sd=G_sd[i]))
+      }
+      if(dist=="gamma"){
+      
+      }
+      tag_yn[i]<-rbinom(1,1,tag_reten_G)
+    } else{
+      G_amt[i]=0
+      tag_yn[i]<-rbinom(1,1,tag_reten_N)
+    }
+    end_L[i]=sta_L[i]+G_amt[i]
+    #determine which lobsters are caught
+    p_catch[i]<-1-exp(-(f/90)*DaL[i]*sel(end_L[i],sel_int,sel_slope))
+    c_yn[i]<-rbinom(1,1,p_catch[i])
+    
+  }
+  data<-data.frame(cbind(sta_L,end_L,G_amt,DaL,g_yn,c_yn,tag_yn))
+  return(data)
+}
+
+#Make G_prob_beta and G_amt_beta
+G_prob_beta<-c(res$int_pg,res$beta_slength_pg,res$beta_dal_pg)
+G_amt_beta<-c(res$int_ag,res$beta_slength_ag,res$beta_dal_ag)
+cv<-res$G_sd[1]
+X=cbind(rep(1,length(data_sdt$slength)),data_sdt$slength,data_sdt$dal,data_sdt$temp)
+X=rbind(X,X,X,X,X)
+X=rbind(X,X,X,X,X) #Make bigger data set
+X=rbind(X,X,X,X,X)
+tag_reten_G<-prob_reten_given_molt
+tag_reten_N<-prob_reten_given_no_molt
+f=1.5
+dist="lognormal"
+
+real_params<-c(G_prob_beta,G_amt_beta,cv)
+
+nsims<-100
+results<-matrix(0,nrow=nsims,ncol=5)
+plength=seq(55.5,225.5,5)
+results_p_G<-matrix(0,nrow=nsims,ncol=length(plength))
+
+for(i in 1:nsims){
+#call simulation function
+lob_dat<-simulate_lobster_G(G_prob_beta,G_amt_beta,cv,X,f,tag_reten_G,tag_reten_N,dist,sel_parms$int,sel_parms$slope)
+
+#pull out lobsters that were caught and retained their tag
+sim_dat<-subset(lob_dat,c_yn==1 & tag_yn==1)
+
+#make new data file to put into estimation model
+
+data_sdt<-list(slength=sim_dat$sta_L,
+              dal=sim_dat$DaL,
+              temp=rep(1,length(sim_dat$sta_L)),
+              obs_inc=sim_dat$G_amt,
+              grow_yn=sim_dat$g_yn,
+              dist="lognormal", #Choose distribution for growth amount: "normal" or "lognormal"
+              #dist="normal",
+              plength=seq(55.5,225.5,5), #midpoints of bins for predicted probability and amount of growth for use in transition matrices 
+              #pdal=365/4, #days at large for predicted growth
+              pdal=365, #days at large for predicted growth
+              ptemp=1, #temperature for predicted growth
+              lbin_wd=lbin_wd, #width of length bin for integration
+              lbins=as.numeric(seq(0,30,lbin_wd)), #length increments for integration for selectivity effects
+              sel_int=10, #sel_parms$int,
+              sel_slope=0 #sel_parms$slope
+           )
+
+
+parms_sdt<-list(int_pg=0, #intercept for probability of growth
+               beta_slength_pg=-0.05, #starting length effect for probability of growth
+               beta_dal_pg=0.0, #days at large effect for probability of growth
+               beta_temp_pg=0.0, #temperature effect for probability of growth
+               int_ag=8.0, #intercept for amount of growth
+               beta_slength_ag=0.0, #starting length effect for amount of growth
+               beta_dal_ag=0.0, #days at large effect for amount of growth
+               beta_temp_ag=0.0, #temperature effect for amount of growth
+               logcv=log(0.1) #CV parameter for amount of growth - CV if dist=normal, log-scale SD if dist=lognormal
+            )
+
+parms_est_sdt<-list(int_pg=as.factor(1), #intercept for probability of growth
+               beta_slength_pg=as.factor(1), #starting length effect for probability of growth
+               beta_dal_pg=as.factor(NA), #days at large effect for probability of growth
+               beta_temp_pg=as.factor(NA), #temperature effect for probability of growth
+               int_ag=as.factor(1), #intercept for amount of growth
+               beta_slength_ag=as.factor(1), #starting length effect for amount of growth
+               beta_dal_ag=as.factor(NA), #days at large effect for amount of growth
+               beta_temp_ag=as.factor(NA), #temperature effect for amount of growth
+               logcv=as.factor(1) #CV parameter for amount of growth - CV if dist=normal, log-scale SD if dist=lognormal
+            )
+
+#####################
+
+#call make adm function
+obj_sdt<-MakeADFun(est_growth_sdt, parms_sdt, map = parms_est_sdt)
+
+est_growth_sdt(parms_sdt)
+
+#run model
+opt_sdt<- nlminb(obj_sdt$par, 
+             obj_sdt$fn, 
+             obj_sdt$gr, 
+             control = list(eval.max = 200000, iter.max=200000),
+             lower = -50,
+             upper = 50) #estimate parameters
+
+#Get report
+res<-obj_sdt$report()
+#Get SEs
+sdr <- sdreport(obj_sdt)
+opt_sdt
+
+results[i,]<-sdr$par.fixed
+results_p_G[i,]<-correct_G_prob(res$prob_growth,tag_reten_G,tag_reten_N)
+
+}
+
+est_params<-colMeans(results)
+seint_inc<-sd(results[,3])/sqrt(nrow(results))
+seint_slope<-sd(results[,4])/sqrt(nrow(results))
+exp(est_params[5])-real_params[7] #check to see if diff between sim and est sd is small
+
+old_results<-(colMeans(results)-real_params[-c(3,6)])/real_params[-c(3,6)]
+
+est<-colMeans(results_p_G)
+est[5]
+tru_g_prob<-logistic_p(linear(cbind(rep(1,length(plength)),plength,rep(1,length(plength))),G_prob_beta))
+correct_results<-plot(est-tru_g_prob)
+
+#Compare estimates to true values
+
+est_g_prob<-res$prob_growth
+comp1<-data.frame(len=plength,prob=est_g_prob,type=rep("est_no_cor",length(plength)))
+comp1<-rbind(comp1,data.frame(len=plength,prob=tru_g_prob,type=rep("true",length(plength))))
+#correct for tag loss
+new_est<-correct_G_prob(res$prob_growth,tag_reten_G,tag_reten_N)
+comp1<-rbind(comp1,data.frame(len=plength,prob=new_est,type=rep("est_cor",length(plength))))
+
+#Compare estimates corrected for tag loss to true values
+ggplot(data=comp1,aes(x=len,y=prob,color=type))+
+  geom_line()
+}
+
+#GN
+#real_params_inc<-real_params[4:5]
+#est_params_inc<-est_params[3:4]
+
+```
+
+## Archived data exploration plots and analyses
+
+```{r}
+#Examine SizeDiff>20
+# ggplot(filter(GOMGBKdat,seasspan ==1),aes(TagCL,SizeDiff))+geom_point()+ggtitle(paste("GOMGBK","End of quarter",2,sep=" "))+ geom_point(data=filter(GOMGBKdat,seasspan ==1 & SizeDiff>=20), aes(x=TagCL, y=SizeDiff), colour="red", size=5)+facet_wrap(~Sex)+ theme_classic() 
+# ggplot(filter(GOMGBKdat,seasspan==2),aes(TagCL,SizeDiff))+geom_point()+ggtitle(paste("GOMGBK","End of quarter",3,sep=" "))+ geom_point(data=filter(GOMGBKdat,seasspan ==2 & SizeDiff>=20), aes(x=TagCL, y=SizeDiff), colour="red", size=5)+facet_wrap(~Sex)+ theme_classic() 
+# ggplot(filter(SNEdat,seasspan==1),aes(TagCL,SizeDiff))+geom_point()+ggtitle(paste("SNE","End of quarter",2,sep=" "))+ geom_point(data=filter(SNEdat,seasspan ==1 & SizeDiff>=20), aes(x=TagCL, y=SizeDiff), colour="red", size=5)+facet_wrap(~Sex)+ theme_classic() 
+#  ggplot(filter(SNEdat,seasspan==2),aes(TagCL,SizeDiff))+geom_point()+ggtitle(paste("SNE","End of quarter",3,sep=" "))+ geom_point(data=filter(SNEdat,seasspan ==2 & SizeDiff>=20), aes(x=TagCL, y=SizeDiff), colour="red", size=5)+facet_wrap(~Sex)+ theme_classic() 
+
+
+#Assign temps to tag or recap year?
+#testGtag<-filter(alltag,SU=="GOMGBK");median(testGtag$TagMonth);median(testGtag$CapMonth) #9/7
+#testStag<-filter(alltag,SU=="SNE");median(testStag$TagMonth);median(testStag$CapMonth) #9/6
+
+#Compare SNE in/offshore time series
+#ggplot(filter(tdat,SU=="SNE"),aes(CapYear,GDD,group=Region,color=Region))+geom_point()+geom_line()
+
+#Examine DAL for non-growers
+# ggplot(alltag,aes(TagCL,DaysAtLarge))+geom_point()+theme_classic()+facet_wrap(~SU+Sex)+scale_x_continuous(limits = c(0, 500))
+# newdat<-alltag
+# newdat$grow_yn<-ifelse(newdat$SizeDiff>tol,1,0)
+# 
+# ggplot(newdat,aes(TagCL,DaysAtLarge,color=factor(grow_yn)))+geom_point(alpha=0.25)+theme_classic()+facet_wrap(~SU+Sex)+scale_x_continuous(n.breaks=10)
+# lazy<-filter(newdat,grow_yn==0)#&DaysAtLarge<500)
+# ggplot(lazy,aes(TagCL,DaysAtLarge))+geom_point()+theme_classic()+facet_wrap(~SU+Sex)
+# newdatSNE<-filter(newdat,SU=="SNE")
+# newdatGOMGBK<-filter(newdat,SU=="GOMGBK")
+# table(newdatSNE$grow_yn); 3244/sum(3244+5980)
+# table(newdatGOMGBK$grow_yn); 18459  /sum(18459  +2212 )
+
+# SNE_S2_F <-  as.matrix(read_excel("Assmt GTMs.xlsx", sheet = 5, col_names = TRUE))
+# SNE_S2_F_probG=cbind(midbins,1-diag(SNE_S2_F));colnames(SNE_S2_F_probG)=c("x","y")
+# SNE_S2_M <-  as.matrix(read_excel("Assmt GTMs.xlsx", sheet = 6, col_names = TRUE))
+# SNE_S2_M_probG=cbind(midbins,1-diag(SNE_S2_M));colnames(SNE_S2_M_probG)=c("x","y")
+# SNE_S3_F <-  as.matrix(read_excel("Assmt GTMs.xlsx", sheet = 7, col_names = TRUE))
+# SNE_S3_F_probG=cbind(midbins,1-diag(SNE_S3_F));colnames(SNE_S3_F_probG)=c("x","y")
+# SNE_S3_M <-  as.matrix(read_excel("Assmt GTMs.xlsx", sheet = 8, col_names = TRUE))
+# SNE_S3_M_probG=cbind(midbins,1-diag(SNE_S3_M));colnames(SNE_S3_M_probG)=c("x","y")
+
+#Examine DAL for non-growers
+# ggplot(alltag,aes(TagCL,DaysAtLarge))+geom_point()+theme_classic()+facet_wrap(~SU+Sex)
+# newdat=alltag
+# newdat$grow_yn<-ifelse(newdat$SizeDiff>tol,1,0)
+# 
+# ggplot(newdat,aes(TagCL,DaysAtLarge,color=factor(grow_yn)))+geom_point(outlier.shape=NA,alpha=0.2)+theme_classic()+facet_wrap(~SU+Sex)+scale_x_continuous(n.breaks=10)
+# lazy<-filter(newdat,grow_yn==0)#&DaysAtLarge<500)
+# ggplot(lazy,aes(TagCL,DaysAtLarge))+geom_point()+theme_classic()+facet_wrap(~SU+Sex)
+# newdatSNE<-filter(newdat,SU=="SNE")
+# newdatGOMGBK<-filter(newdat,SU=="GOMGBK")
+# table(newdatSNE$grow_yn); 3244/sum(3244+5980)
+# table(newdatGOMGBK$grow_yn); 18459  /sum(18459  +2212 )
+
+#plots not corrected for selectivity
+# #predicted growth (if grew)
+# obs<-data.frame(cbind(data_sdt$slength,data_sdt$obs_inc))
+# est<-data.frame(cbind(data_sdt$slength,res$G_mean))
+# names(obs)<-c("length","increment")
+# names(est)<-c("length","increment")
+# if(data_sdt$dist=="normal"){
+#   boundsp1<-data.frame(cbind(data_sdt$slength,res$G_mean+1.96*res$G_sd))
+#   boundsp2<-data.frame(cbind((data_sdt$slength),(res$G_mean-1.96*res$G_sd)))
+# }
+# if(data_sdt$dist=="lognormal"){
+#   boundsp1<-data.frame(cbind(data_sdt$slength,exp(log(res$G_mean)+1.96*res$G_sd)))
+#   boundsp2<-data.frame(cbind((data_sdt$slength),(exp(log(res$G_mean)-1.96*res$G_sd))))
+# }
+# names(boundsp1)<-c("length","increment")
+# names(boundsp2)<-c("length","increment")
+# bounds<-rbind(boundsp1[order(boundsp1$length),],(boundsp2[order(-boundsp2$length),]))
+# 
+# plot2<-ggplot(data=obs[which(data_sdt$grow_yn==1),],aes(x=length,y=increment))+
+#   geom_point()+
+#   geom_smooth(data=est,aes(x=length,y=increment),se=FALSE,color="black")+
+#   #geom_line(data=est,aes(x=length,y=increment))+ #shows DAL effect but hard to read
+#   theme_classic(base_size = 25)+
+#   geom_polygon(data=bounds,aes(x=length,y=increment),fill="slategray",alpha=0.2)+
+#   xlab("Carapace length (mm)")+
+#   ylab("Growth increment (mm)")+
+#   xlim(50,max(data_sdt$slength))+
+#   ylim(0,mxinc)
+# print(plot2)
+# #Plot standardized residuals for lobsters that grew
+# if(data_sdt$dist=="normal"){
+#   residual<-ifelse(data_sdt$obs_inc>tol,data_sdt$obs_inc,NA)-res$G_mean
+# }
+# if(data_sdt$dist=="lognormal"){
+#   residual<-ifelse(data_sdt$obs_inc>tol,log(data_sdt$obs_inc),NA)-log(res$G_mean)
+# }
+# plot(x=data_sdt$slength,y=residual/res$G_sd,
+#      xlab="Carapace length (mm)",
+#      ylab="Standardized residuals",
+#      pch = 19, 
+#      main = "", 
+#      cex = 1.5,      
+#      cex.lab = 1.5,  
+#      cex.axis = 1.2
+#      );abline(h=0,lwd=2)
+# 
+# #QQ plot for standardized growth residuals
+# qqnorm(residual/res$G_sd,
+#        pch=19,
+#        main="",
+#        cex = 1.5,      
+#        cex.lab = 1.5,  
+#        cex.axis = 1.2);qqline(residual/res$G_sd,lwd=2)
+
+
+```
