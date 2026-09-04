@@ -79,8 +79,7 @@ tolmeth<-1 #1=use tolerance threshold for growth/no growth as specified on next 
 tol<-3 #tolerance for "no growth"
 percCL<-0.05 
 
-usetemp<-1 #1=use temperature/growting degree day (GDD) data, otherwise not
-#**Also turn on line 630 if using temp/GDD data
+usetemp<-1 #1=use temperature/growting degree day (GDD) data, otherwise not. **Also be sure to turn on parameter for temp in parms_est_sdt: beta_temp_ag=as.factor(1)
 sneGDD<-"Inshore" #"SlectInshore" vs "Offshore" GDD time series
 
 age53G<-5 #assumed age at 53mmCL in GOMGBK for plotting age data vs growth estimates
