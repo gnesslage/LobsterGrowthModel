@@ -80,6 +80,7 @@ tol<-3 #tolerance for "no growth"
 percCL<-0.05 
 
 usetemp<-0 #1=use temperature/growting degree day (GDD) data, otherwise not
+#**Also turn on line 630 if using temp/GDD data
 sneGDD<-"Inshore" #"SlectInshore" vs "Offshore" GDD time series
 
 age53G<-5 #assumed age at 53mmCL in GOMGBK for plotting age data vs growth estimates
